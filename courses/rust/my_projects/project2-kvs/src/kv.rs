@@ -1,69 +1,85 @@
 use failure::{format_err, Error};
 use serde::{Deserialize, Serialize};
+use serde_json::Deserializer;
 use std::collections::HashMap;
+use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::prelude::*;
+use std::io::{prelude::*, BufReader, BufWriter, SeekFrom};
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct KvData {
-    op: u8,
-    key: String,
-    value: Option<String>,
+const COMPACT_LIMIT: u64 = 1024 * 8;
+
+#[derive(Serialize, Deserialize)]
+enum Command {
+    Set { key: String, value: String },
+    Remove { key: String },
+}
+
+pub struct CommandEntry {
+    pos: u64,
+    len: u64,
 }
 
 #[derive()]
 pub struct KvStore {
-    map: HashMap<String, String>,
-    data: Vec<KvData>,
     filepath: PathBuf,
+    index: HashMap<String, CommandEntry>,
+    writer: BufWriter<File>,
+    cmd_num: u64,
+    pos: u64,
 }
 
 impl KvStore {
-    /// Creates a `KvStore`.
-    pub fn new() -> Result<KvStore> {
-        Ok(KvStore {
-            map: HashMap::new(),
-            data: Vec::new(),
-            filepath: PathBuf::from("datafile"),
-        })
-    }
-
     /// open a kvstore file
     pub fn open(file_path: &std::path::Path) -> Result<KvStore> {
         let filepath = file_path.join("datafile");
         if !filepath.exists() {
             File::create(&filepath)?;
         }
-        let data = std::fs::read_to_string(&filepath)?;
 
-        let mut kvdata: Vec<KvData> = Vec::new();
-        if !data.is_empty() {
-            kvdata = serde_json::from_str(&data)?;
-        }
-        // eprintln!("{:?}", kvdata);
-        let mut map: HashMap<String, String> = HashMap::new();
-        for item in kvdata.iter() {
-            match item.op {
-                0 => {
-                    map.remove(&item.key);
+        let file = File::open(filepath.clone())?;
+        let mut reader = BufReader::new(&file);
+        let mut pos = reader.seek(SeekFrom::Start(0))?;
+        let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+
+        let mut index = HashMap::new();
+        let mut cmd_num = 0;
+
+        while let Some(cmd) = stream.next() {
+            let cmd = cmd?;
+            let new_pos = stream.byte_offset() as u64;
+            let len = new_pos - pos;
+            match cmd {
+                Command::Set { key, .. } => {
+                    index.insert(key, CommandEntry { pos, len });
                 }
-                1 => {
-                    map.insert(
-                        item.key.clone(),
-                        item.value.clone().expect("Retriving log: False format."),
-                    );
+                Command::Remove { key } => {
+                    index.insert(key, CommandEntry { pos, len });
                 }
-                _ => return Err(format_err!("bad data.")),
             }
+
+            pos = new_pos;
+            cmd_num += 1;
         }
+
+        // println!("Init: {:?}", index.keys());
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&filepath)?;
+        let mut writer = BufWriter::new(file);
+
+        writer.seek(SeekFrom::Start(pos))?;
 
         Ok(KvStore {
-            map,
-            data: kvdata,
-            filepath: PathBuf::from(file_path.join("datafile")),
+            filepath,
+            index,
+            writer,
+            cmd_num,
+            pos,
         })
     }
 
@@ -71,13 +87,26 @@ impl KvStore {
     ///
     /// If the key already exists, the previous value will be overwritten.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.data.push(KvData {
-            op: 1,
+        let cmd = Command::Set {
             key: key.clone(),
-            value: Some(value.clone()),
-        });
+            value: value.clone(),
+        };
+        let payload = serde_json::to_string(&cmd)?;
+        self.writer.write(payload.as_bytes())?;
 
-        self.map.insert(key, value);
+        let new_pos = self.writer.stream_position()?;
+        self.index.insert(
+            key,
+            CommandEntry {
+                pos: self.pos,
+                len: new_pos - self.pos,
+            },
+        );
+        self.pos = new_pos;
+        self.cmd_num += 1;
+
+        self.compact()?;
+
         Ok(())
     }
 
@@ -85,55 +114,103 @@ impl KvStore {
     ///
     /// Returns `None` if the given key does not exist.
     pub fn get(&self, key: String) -> Result<Option<String>> {
-        Ok(self.map.get(&key).map(|s| s.to_string()))
+        match self.index.get(&key) {
+            Some(cmd_entry) => {
+                let file = OpenOptions::new().read(true).open(&self.filepath)?;
+                let mut buf_reader = BufReader::new(file);
+                match read_single(&mut buf_reader, cmd_entry.pos, cmd_entry.len)? {
+                    Command::Set { key: _, value: v } => Ok(Some(v)),
+                    Command::Remove { key: _ } => Ok(None),
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     /// Remove a given key.
     pub fn remove(&mut self, key: String) -> Result<String> {
-        self.data.push(KvData {
-            op: 0,
-            key: key.clone(),
-            value: None,
-        });
+        let pre_value = match self.get(key.clone()).expect("Key not found") {
+            None => {
+                return Err(format_err!("Key not found"));
+            }
+            Some(v) => v,
+        };
 
-        match self.map.remove(&key) {
-            Some(v) => Ok(v), 
-            None => Err(format_err!("Key not found")),
-        }
+        let cmd = Command::Remove { key: key.clone() };
+        let payload = serde_json::to_string(&cmd)?;
+        self.writer.write(payload.as_bytes())?;
+
+        let new_pos = self.writer.stream_position()?;
+        self.pos = new_pos;
+        self.cmd_num += 1;
+        // self.index.insert(key, CommandEntry { pos: self.pos, len: new_pos - self.pos });
+        self.index.remove(&key); // more efficient
+
+        self.compact()?;
+
+        Ok(pre_value)
     }
 
     /// compact the data
     fn compact(&mut self) -> Result<()> {
-        self.data.clear();
-        for pair in self.map.iter() {
-            self.data.push(
-                KvData {
-                   op: 1,
-                   key: pair.0.to_string(),
-                   value: Some(pair.1.to_string()), 
-                }
-            )
+        if self.cmd_num < COMPACT_LIMIT {
+            return Ok(());
         }
-        Ok(())
-    }
 
-    /// commit the data, overwrite them all
-    fn commit(&self) -> Result<()> {
-        // let mut file = OpenOptions::new()
-        //     .write(true)
-        //     .open(self.filepath.as_path())
-        //     .unwrap();
-        let mut file = File::create(self.filepath.as_path())?;
+        let archaic_file = std::path::Path::new("archaic");
+        let file = OpenOptions::new().read(true).open(&self.filepath)?;
+        let mut reader = BufReader::new(file);
+        fs::rename(&self.filepath, archaic_file)?;
 
-        let new_json = serde_json::to_string(&self.data).unwrap();
-        file.write(new_json.as_bytes()).unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&self.filepath)?;
+        self.writer = BufWriter::new(file);
+
+        let mut index = HashMap::new();
+        self.pos = 0;
+        self.cmd_num = 0;
+
+        for cmd_entry in self.index.values() {
+            match read_single(&mut reader, cmd_entry.pos, cmd_entry.len)? {
+                Command::Set {
+                    key,
+                    value,
+                } => {
+                    let cmd = Command::Set {
+                        key: key.clone(),
+                        value: value.clone(),
+                    };
+                    let payload = serde_json::to_string(&cmd)?;
+                    self.writer.write(payload.as_bytes())?;
+
+                    let new_pos = self.writer.stream_position()?;
+                    index.insert(
+                        key,
+                        CommandEntry {
+                            pos: self.pos,
+                            len: new_pos - self.pos,
+                        },
+                    );
+                    self.pos = new_pos;
+                    self.cmd_num += 1;
+                }
+                Command::Remove { key: _ } => (),
+            }
+        }
+        fs::remove_file(archaic_file)?;
         Ok(())
     }
 }
 
-impl Drop for KvStore {
-    fn drop(&mut self) {
-        self.compact().unwrap();
-        self.commit().unwrap();
-    }
+fn read_single<R: Read + Seek>(
+    buf_reader: &mut BufReader<R>,
+    pos: u64,
+    len: u64,
+) -> Result<Command> {
+    buf_reader.seek(SeekFrom::Start(pos as u64))?;
+    let taker = buf_reader.take(len as u64);
+    let cmd: Command = serde_json::from_reader(taker)?;
+    Ok(cmd)
 }

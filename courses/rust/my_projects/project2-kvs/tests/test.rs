@@ -250,6 +250,7 @@ fn remove_key() -> Result<()> {
     let mut store = KvStore::open(temp_dir.path())?;
     store.set("key1".to_owned(), "value1".to_owned())?;
     assert!(store.remove("key1".to_owned()).is_ok());
+    println!("What the fuck {:?}", store.get("key1".to_owned()));
     assert_eq!(store.get("key1".to_owned())?, None);
     Ok(())
 }
